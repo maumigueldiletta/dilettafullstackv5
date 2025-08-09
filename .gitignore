@@ -4,3 +4,5 @@ flutter_app/build/
 .packages
 pubspec.lock
 node_modules/
+backend/config.json
+backend/config.json
