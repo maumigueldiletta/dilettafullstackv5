@@ -6,3 +6,7 @@ pubspec.lock
 node_modules/
 backend/config.json
 backend/config.json
+backend/config.json
+config.json
+build/
+flutter_app/build/
