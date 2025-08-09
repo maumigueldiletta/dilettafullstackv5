@@ -1,0 +1,146 @@
+
+import fs from 'fs';
+import path from 'path';
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import { fileURLToPath } from 'url';
+import OpenAI from 'openai';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const cfgPath = path.join(__dirname, 'config.json');
+const CFG = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+
+const TOKEN = CFG.PIPEDRIVE_API_TOKEN || '';
+const CLIENT_DOMAIN = CFG.CLIENT_DOMAIN || '';
+const OPENAI_KEY = CFG.OPENAI_API_KEY || '';
+const MODEL = CFG.ASSISTANT_MODEL || 'gpt-4o-mini';
+const PORT = Number(CFG.PORT || 8787);
+
+const app = express();
+app.use(cors());
+app.use(express.json({limit:'8mb'}));
+
+const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
+
+function pdUrl(pathname, params = {}) {
+  const base = CLIENT_DOMAIN ? `https://${CLIENT_DOMAIN}.pipedrive.com/v1/` : `https://api.pipedrive.com/v1/`;
+  const url = new URL(pathname, base);
+  Object.entries(params).forEach(([k,v]) => { if (v!==undefined && v!==null) url.searchParams.set(k, String(v)); });
+  url.searchParams.set('api_token', TOKEN || '');
+  return url.toString();
+}
+async function pdGet(pathname, params) {
+  const res = await fetch(pdUrl(pathname, params));
+  if (!res.ok) throw new Error(`Pipedrive ${res.status}: ${await res.text()}`);
+  return await res.json();
+}
+
+app.get('/health', (_,res)=> res.json({ok:true}));
+
+app.get('/api/pd/deals', async (req,res)=>{
+  try { res.json(await pdGet('deals', { start:req.query.start, limit:req.query.limit, status:req.query.status })); }
+  catch(e){ res.status(500).json({error:String(e)}); }
+});
+app.get('/api/pd/activities', async (req,res)=>{
+  try { res.json(await pdGet('activities', { start:req.query.start, limit:req.query.limit })); }
+  catch(e){ res.status(500).json({error:String(e)}); }
+});
+app.get('/api/pd/notes', async (req,res)=>{
+  try { res.json(await pdGet('notes', { start:req.query.start, limit:req.query.limit })); }
+  catch(e){ res.status(500).json({error:String(e)}); }
+});
+
+app.get('/api/kpis', async (req,res)=>{
+  try {
+    const now = new Date();
+    const since30 = new Date(now.getTime() - 30*24*60*60*1000);
+    const deals = (await pdGet('deals', { limit: 500 })).data ?? [];
+    const activities = (await pdGet('activities', { limit: 500 })).data ?? [];
+
+    const novos30d = deals.filter(d => new Date(d.add_time) >= since30).length;
+    const pipelineValor = deals.filter(d => ['open','won'].includes(d.status)).reduce((s,d)=> s+(Number(d.value)||0),0);
+
+    const since90 = new Date(now.getTime() - 90*24*60*60*1000);
+    const closed90 = deals.filter(d => (d.status==='won'||d.status==='lost') && new Date(d.update_time) >= since90);
+    const won = closed90.filter(d => d.status==='won').length;
+    const winRate90 = closed90.length ? Math.round(won/closed90.length*100) : 0;
+
+    const pendAtiv = activities.filter(a=> a.done === false).length;
+
+    const stageMap = new Map();
+    for (const d of deals) {
+      if (['open','won'].includes(d.status)) {
+        const key = d.stage_name || `Stage ${d.stage_id}`;
+        stageMap.set(key, (stageMap.get(key)||0) + (Number(d.value)||0));
+      }
+    }
+    const pipeline = Array.from(stageMap.entries()).map(([name,value])=>({name, value}));
+
+    res.json({ data: { novos30d, pipelineValor, winRate90, pendAtiv, pipeline } });
+  } catch(e){ res.status(500).json({error:String(e)}); }
+});
+
+// Assistant with graceful 429 fallback
+app.post('/api/assistant', async (req,res)=>{
+  try {
+    const { query } = req.body || {};
+    if (!query) return res.status(400).json({error:'missing query'});
+
+    const [deals, notes, activities] = await Promise.all([
+      pdGet('deals', { limit: 500 }),
+      pdGet('notes', { limit: 500 }),
+      pdGet('activities', { limit: 500 }),
+    ]);
+    const dData = deals.data || [];
+    const nData = notes.data || [];
+    const aData = activities.data || [];
+
+    const parts = [];
+    parts.push('DEALS:');
+    for (const d of dData) {
+      parts.push(`- [${d.id}] ${d.title} | valor=${d.value} | stage=${d.stage_name||d.stage_id} | owner=${d.owner_name||d.owner_id} | status=${d.status} | org=${d.org_name||d.org_id} | add=${d.add_time} | upd=${d.update_time}`);
+    }
+    parts.push('\nNOTES:');
+    for (const n of nData) {
+      const clean = (n.content||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,500);
+      parts.push(`- [${n.id}] deal=${n.deal_id} org=${n.org_id} person=${n.person_id} | ${clean}`);
+    }
+    parts.push('\nACTIVITIES:');
+    for (const a of aData) {
+      const clean = (a.note||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,300);
+      parts.push(`- [${a.id}] ${a.type}:${a.subject} due=${a.due_date} done=${a.done} deal=${a.deal_id} owner=${a.user_id} | ${clean}`);
+    }
+    const context = parts.join('\n').slice(0, 15000);
+
+    if (!openai) {
+      return res.json({ answer: `([demo]) Pergunta: "${query}". Contexto: ${context.length} chars. Configure OPENAI_API_KEY para resposta real.` });
+    }
+
+    try {
+      const completion = await openai.chat.completions.create({
+        model: MODEL,
+        messages: [
+          { role: 'system', content: 'Você é um analista de vendas da Diletta. Responda somente com base no contexto do Pipedrive a seguir.' },
+          { role: 'user', content: `Pergunta: ${query}\n\nContexto:\n${context}` }
+        ],
+        temperature: 0.2,
+      });
+      const answer = completion.choices?.[0]?.message?.content ?? '(sem resposta)';
+      return res.json({ answer });
+    } catch (e) {
+      const msg = String(e);
+      // Graceful 429 / quota exceeded
+      if (msg.includes('429') || msg.toLowerCase().includes('quota')) }
+          return res.status(200).json({ answer: 'No momento a cota da API está esgotada (erro 429). O Assistant está em modo leitura: não consigo gerar análise avançada agora, mas seus dados foram carregados (deals/notas/atividades). Assim que recarregarmos a cota, basta tentar novamente.' });
+      throw e;
+    }
+  } catch(e){ res.status(500).json({error:String(e)}); }
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/', (_,res)=> res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+app.listen(PORT, ()=> console.log(`✅ Backend ligado em http://localhost:${PORT} (modelo: ${MODEL})`));

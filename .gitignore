@@ -1,0 +1,6 @@
+backend/config.json
+flutter_app/build/
+.dart_tool/
+.packages
+pubspec.lock
+node_modules/
