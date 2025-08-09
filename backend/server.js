@@ -9,18 +9,24 @@ import OpenAI from 'openai';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// tenta ler config.json se existir, mas não obriga
 const cfgPath = path.join(__dirname, 'config.json');
-if (!fs.existsSync(cfgPath)) { console.error('Faltando backend/config.json'); process.exit(1); }
-const CFG = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+let CFG = {};
+try {
+  if (fs.existsSync(cfgPath)) {
+    CFG = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  }
+} catch (_) { /* segue sem config.json */ }
 
-const TOKEN = CFG.PIPEDRIVE_API_TOKEN || '';
-const CLIENT_DOMAIN = CFG.CLIENT_DOMAIN || '';
-const OPENAI_KEY = CFG.OPENAI_API_KEY || '';
-const MODEL = CFG.ASSISTANT_MODEL || 'gpt-4o-mini';
-const PORT = Number(CFG.PORT || 8787);
+// PRIORIDADE: ENV > config.json > default
+const TOKEN         = process.env.PIPEDRIVE_API_TOKEN || CFG.PIPEDRIVE_API_TOKEN || '';
+const CLIENT_DOMAIN = process.env.CLIENT_DOMAIN        || CFG.CLIENT_DOMAIN        || '';
+const OPENAI_KEY    = process.env.OPENAI_API_KEY      || CFG.OPENAI_API_KEY      || '';
+const MODEL         = process.env.ASSISTANT_MODEL     || CFG.ASSISTANT_MODEL     || 'gpt-4o-mini';
+const PORT          = Number(process.env.PORT || CFG.PORT || 8787);
 
 const app = express();
-app.use(cors());
+app.use(cors()); // se quiser travar depois: cors({ origin: ['https://SEUSITE.netlify.app'] })
 app.use(express.json({ limit: '8mb' }));
 
 const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
@@ -138,7 +144,4 @@ app.post('/api/assistant', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
-app.listen(PORT, () => console.log(`✅ Backend ligado em http://localhost:${PORT} (modelo: ${MODEL})`));
+app.listen(PORT, () => console.log(`✅ Backend ligado em 0.0.0.0:${PORT} (modelo: ${MODEL})`));
